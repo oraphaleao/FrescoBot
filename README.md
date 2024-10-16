@@ -27,7 +27,6 @@ The bot currently supports the following commands, using the prefix `!!` (config
 - Improve play structure and put the feature of download the music and play it with ffmpeg;
 - Improve the bot to recognize playlists (Doesn't matter if it's from Youtube or Spotify);
 - Improve Rich Presence of it;
-- Add Embed information of actual music;
 - Improve interaction of Bot between music and user;
 - Expand the options and put others supported plataforms to it;
 - Much more...
