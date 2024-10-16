@@ -1,8 +1,10 @@
 const { getVoiceConnection, joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+const { EmbedBuilder, Colors } = require('discord.js');
 const ytdl = require('@distube/ytdl-core');
 const SpotifyHandler = require('./SpotifyHandler');
 const YouTubeHandler = require('./YouTubeHandler');
 const logger = require('../utils/logger');
+const Utils = require('../utils/utils');
 
 class MusicPlayer {
     constructor() {
@@ -62,7 +64,7 @@ class MusicPlayer {
             logger.error('Unable to determine guild ID in playNext');
             return;
         }
-
+    
         const serverQueue = this.queue.get(guildId);
         if (!serverQueue || serverQueue.length === 0) {
             this.queue.delete(guildId);
@@ -71,65 +73,124 @@ class MusicPlayer {
             this.currentMessage = null;
             return;
         }
-
-        const song = serverQueue[0]; // Don't remove the song yet
-
+    
+        const song = serverQueue[0]; // Não remover a música ainda
+    
         try {
             let videoUrl;
+            let songInfo;
+    
             if (song.query.includes('open.spotify.com')) {
+                // Obtendo informações da música do Spotify
                 const trackInfo = await this.spotifyHandler.getTrackInfo(song.query);
+                logger.info('Track info from Spotify:', trackInfo); // Log de debug
+    
                 videoUrl = await this.youtubeHandler.search(`${trackInfo.name} ${trackInfo.artists}`);
+                logger.info('Video URL from YouTube search:', videoUrl); // Log de debug
+                
+                // Verifique se o videoUrl foi retornado corretamente
+                if (!videoUrl) {
+                    logger.error('No video URL found for track:', trackInfo);
+                    throw new Error('Video URL not found');
+                }
+    
+                songInfo = {
+                    title: trackInfo.name || 'Unknown Title',
+                    author: trackInfo.artists || 'Unknown',
+                    duration: trackInfo.duration ? Utils.formatDuration(trackInfo.duration) : 'Unkown',
+                    thumbnail: trackInfo.albumCover || null // Pega a miniatura (capa do álbum)
+                };
             } else {
                 videoUrl = await this.youtubeHandler.search(song.query);
-            }
+                logger.info('Video URL from search:', videoUrl); // Log de debug
+                if (videoUrl) {
+                    songInfo = await ytdl.getInfo(videoUrl); // Buscar informações sobre a música do YouTube
+                    logger.info('Song info from YouTube:', songInfo); // Log de debug
 
-            if (!videoUrl) {
+                    // Definindo songInfo com informações do YouTube
+                    const videoDetails = songInfo.videoDetails;
+
+                    // Condições para extrair informações relevantes do YouTube
+                    songInfo = {
+                        title: videoDetails.title || 'Unknown Title',
+                        author: videoDetails.author.name || 'Unknown',
+                        duration: videoDetails.lengthSeconds ? Utils.formatDuration(videoDetails.lengthSeconds) : 'Unknown',
+                        thumbnail: videoDetails.thumbnails?.[0]?.url || null // Miniatura do vídeo
+                    };
+                }
+            }
+    
+            if (!videoUrl || !songInfo) {
                 if (message) message.channel.send('Could not find the song on YouTube. Skipping to next song.');
-                serverQueue.shift(); // Remove the song if it can't be played
+                serverQueue.shift(); // Remover a música se não puder ser reproduzida
                 return this.playNext(connection, message);
             }
-
+    
             const stream = ytdl(videoUrl, {
                 filter: 'audioonly',
                 quality: 'highestaudio',
                 highWaterMark: 1 << 25,
             });
-
+    
             const resource = createAudioResource(stream);
-
             this.player.play(resource);
-
-            if (message) message.channel.send(`Now playing: ${videoUrl}`);
-
-            serverQueue.shift(); // Remove the song only after it starts playing
-
+    
+            // Se a informação da música for do YouTube, extraia a miniatura
+            const thumbnail = songInfo.thumbnail || songInfo.videoDetails?.thumbnails?.[0]?.url || null;
+    
+            // Criar o embed com informações da música e miniatura
+            const embed = new EmbedBuilder()
+                .setTitle(`🎶 Now Playing`)
+                .setDescription(`[${songInfo.title}](${videoUrl})`)
+                .addFields(
+                    { name: 'Requested by', value: `<@${song.requester}>`, inline: true },
+                    { name: 'Author', value: songInfo.author, inline: true },
+                    { name: 'Duration', value: songInfo.duration, inline: true },
+                    { name: 'Queue Position', value: `#${serverQueue.length}`, inline: true }
+                )
+                .setColor(Colors.Blue) // Use o enum Colors
+                .setThumbnail(thumbnail) // Adiciona a miniatura
+                .setTimestamp();
+    
+            if (message) {
+                message.channel.send({ embeds: [embed] });
+            }
+    
+            serverQueue.shift(); // Remover a música da fila após começar a tocar
+    
             stream.on('error', (error) => {
                 logger.error('Error in audio stream:', error);
                 if (message) message.channel.send('There was an error playing this song. Skipping to next song.');
                 this.playNext(connection, message);
             });
-
+    
         } catch (error) {
+            console.log(error);
             logger.error('Error in playNext method:', error);
             if (message) message.channel.send('There was an error playing this song. Skipping to next song.');
-            serverQueue.shift(); // Remove the problematic song
+            serverQueue.shift(); // Remover a música problemática
             this.playNext(connection, message);
         }
     }
 
     stop(message) {
-        const connection = getVoiceConnection(message.guild.id);
+        const guildId = message.guild.id;
+        const serverQueue = this.queue.get(guildId);
+    
+        if (serverQueue) {
+            serverQueue.songs = []; // Limpa a fila
+            this.queue.delete(guildId); // Remove a fila atual
+        }
+    
+        // Destruir a conexão de voz
+        const connection = getVoiceConnection(guildId);
         if (connection) {
             connection.destroy();
-            this.queue.delete(message.guild.id);
-            this.player.stop();
-            this.currentConnection = null;
-            this.currentMessage = null;
-            message.reply('Music stopped and disconnected from voice channel.');
-        } else {
-            message.reply('I\'m not in a voice channel!');
         }
+    
+        message.channel.send('Playback stopped and queue cleared.');
     }
+    
 
     skip(message) {
         const connection = getVoiceConnection(message.guild.id);

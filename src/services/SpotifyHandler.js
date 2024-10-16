@@ -28,7 +28,9 @@ class SpotifyHandler {
             const track = await this.spotifyApi.getTrack(trackId);
             return {
                 name: track.body.name,
-                artists: track.body.artists.map(artist => artist.name).join(', ')
+                artists: track.body.artists.map(artist => artist.name).join(', '),
+                duration: track.body.duration_ms,
+                albumCover: track.body.album.images[0].url
             };
         } catch (error) {
             logger.error('Error fetching Spotify track:', error);
