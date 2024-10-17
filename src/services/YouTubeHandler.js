@@ -1,4 +1,5 @@
 const search = require('youtube-search');
+const { google } = require('googleapis'); // Importando o Google APIs
 const config = require('../../config/config');
 const logger = require('../utils/logger');
 
@@ -8,6 +9,10 @@ class YouTubeHandler {
             maxResults: 1,
             key: config.YOUTUBE_API_KEY
         };
+        this.youtube = google.youtube({
+            version: 'v3',
+            auth: config.YOUTUBE_API_KEY // Usando a mesma chave de API
+        });
     }
 
     async search(query) {
@@ -25,6 +30,28 @@ class YouTubeHandler {
         } catch (error) {
             logger.error('Error searching YouTube:', error);
             return null; // Retorna null em caso de erro
+        }
+    }
+
+    async getPlaylistTracks(playlistId) {
+        logger.info(`Fetching tracks for playlist ID: ${playlistId}`);
+        try {
+            const response = await this.youtube.playlistItems.list({
+                part: 'snippet',
+                playlistId: playlistId,
+                maxResults: 50, // Ajuste conforme necessário
+            });
+    
+            const tracks = response.data.items.map(item => ({
+                title: item.snippet.title,
+                url: `https://www.youtube.com/watch?v=${item.snippet.resourceId.videoId}`,
+            }));
+    
+            logger.info(`Fetched ${tracks.length} tracks from the playlist.`);
+            return tracks;
+        } catch (error) {
+            logger.error(`Error fetching playlist tracks for ID ${playlistId}:`, error);
+            return []; // Retorna um array vazio em caso de erro
         }
     }
 }

@@ -1,10 +1,20 @@
-const { getVoiceConnection, joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+const {
+    getVoiceConnection,
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus,
+} = require('@discordjs/voice');
 const { EmbedBuilder, Colors } = require('discord.js');
 const ytdl = require('@distube/ytdl-core');
+const ffmpeg = require('fluent-ffmpeg');
+const fs = require('fs');
+const path = require('path');
 const SpotifyHandler = require('./SpotifyHandler');
 const YouTubeHandler = require('./YouTubeHandler');
 const logger = require('../utils/logger');
 const Utils = require('../utils/utils');
+const config = require('../../config/config');
 
 class MusicPlayer {
     constructor() {
@@ -12,6 +22,11 @@ class MusicPlayer {
         this.player = createAudioPlayer();
         this.spotifyHandler = new SpotifyHandler();
         this.youtubeHandler = new YouTubeHandler();
+        this.currentConnection = null;
+        this.currentMessage = null;
+        this.preprocessedTracks = new Map();
+        this.isPreprocessing = false;
+        this.processingQueue = new Set();
 
         this.player.on('error', (error) => {
             logger.error('Error in audio player:', error);
@@ -21,15 +36,12 @@ class MusicPlayer {
         this.player.on(AudioPlayerStatus.Idle, () => {
             this.playNext(this.currentConnection, this.currentMessage);
         });
-
-        this.currentConnection = null;
-        this.currentMessage = null;
     }
 
     async play(message, query) {
         const voiceChannel = message.member.voice.channel;
         if (!voiceChannel) {
-            return message.reply('You need to be in a voice channel to play music!');
+            return message.reply('Você precisa estar em um canal de voz para tocar música!');
         }
 
         try {
@@ -44,17 +56,153 @@ class MusicPlayer {
             }
 
             const serverQueue = this.queue.get(message.guild.id);
-            serverQueue.push({ query, requester: message.author.id });
+
+            // Verifica se é uma playlist
+            if (query.includes('playlist')) {
+                await this.handlePlaylist(message, query);
+                return;
+            }
+
+            const trackInfo = { query, requester: message.author.id };
+            serverQueue.push(trackInfo);
+
+            this.startPreprocessing(message.guild.id, trackInfo);
 
             if (serverQueue.length === 1 && this.player.state.status !== AudioPlayerStatus.Playing) {
                 this.currentMessage = message;
                 await this.playNext(this.currentConnection, message);
             } else {
-                message.reply(`Added to queue: ${query}`);
+                message.reply(`Adicionado à fila: ${query}`);
             }
         } catch (error) {
-            logger.error('Error in play method:', error);
-            message.reply('There was an error trying to play the music. Please try again.');
+            logger.error('Erro ao tentar tocar música:', error);
+            message.reply('Ocorreu um erro ao tentar tocar a música. Por favor, tente novamente.');
+        }
+    }
+
+    async handlePlaylist(message, playlistUrl) {
+        try {
+            const trackUrls = await this.youtubeHandler.getPlaylistTracks(playlistUrl);
+            const serverQueue = this.queue.get(message.guild.id);
+            
+            for (const trackUrl of trackUrls) {
+                const trackInfo = { query: trackUrl, requester: message.author.id };
+                serverQueue.push(trackInfo);
+                this.startPreprocessing(message.guild.id, trackInfo);
+            }
+
+            message.reply(`Adicionadas ${trackUrls.length} músicas à fila da playlist.`);
+            if (serverQueue.length === trackUrls.length && this.player.state.status !== AudioPlayerStatus.Playing) {
+                this.currentMessage = message;
+                await this.playNext(this.currentConnection, message);
+            }
+        } catch (error) {
+            logger.error('Erro ao lidar com a playlist:', error);
+            message.reply('Ocorreu um erro ao tentar processar a playlist. Verifique o link e tente novamente.');
+        }
+    }
+
+    async downloadAndConvertAudio(url, outputPath) {
+        return new Promise((resolve, reject) => {
+            const stream = ytdl(url, {
+                filter: 'audioonly',
+                quality: 'highestaudio',
+            });
+
+            ffmpeg(stream)
+                .audioBitrate(320)
+                .save(outputPath)
+                .on('end', () => {
+                    resolve(outputPath);
+                })
+                .on('error', (err) => {
+                    reject(err);
+                });
+        });
+    }
+
+    async startPreprocessing(guildId, trackInfo) {
+        const trackKey = `${guildId}-${trackInfo.query}`;
+        
+        if (this.preprocessedTracks.has(trackKey) || this.processingQueue.has(trackKey)) {
+            return;
+        }
+
+        this.processingQueue.add(trackKey);
+        
+        try {
+            logger.info(`Iniciando pré-processamento para: ${trackInfo.query}`);
+            await this.preprocessTrack(guildId, trackInfo);
+        } catch (error) {
+            logger.error(`Erro no pré-processamento de ${trackInfo.query}:`, error);
+        } finally {
+            this.processingQueue.delete(trackKey);
+        }
+    }
+
+    async preprocessTrack(guildId, trackInfo) {
+        const trackKey = `${guildId}-${trackInfo.query}`;
+
+        try {
+            let videoUrl;
+            let songInfo;
+
+            if (trackInfo.query.includes('open.spotify.com')) {
+                const spotifyInfo = await this.spotifyHandler.getTrackInfo(trackInfo.query);
+                videoUrl = await this.youtubeHandler.search(`${spotifyInfo.name} ${spotifyInfo.artists}`);
+                songInfo = {
+                    title: spotifyInfo.name || 'Unknown Title',
+                    author: spotifyInfo.artists || 'Unknown',
+                    duration: spotifyInfo.duration ? Utils.formatDuration(spotifyInfo.duration) : 'Unknown',
+                    thumbnail: spotifyInfo.albumCover || null,
+                };
+            } else {
+                videoUrl = await this.youtubeHandler.search(trackInfo.query);
+                const videoDetails = (await ytdl.getInfo(videoUrl)).videoDetails;
+                songInfo = {
+                    title: videoDetails.title || 'Unknown Title',
+                    author: videoDetails.author.name || 'Unknown',
+                    duration: videoDetails.lengthSeconds ? Utils.formatDuration(videoDetails.lengthSeconds) : 'Unknown',
+                    thumbnail: videoDetails.thumbnails?.[0]?.url || null,
+                };
+            }
+
+            const preprocessedData = {
+                videoUrl,
+                songInfo,
+                timestamp: Date.now(),
+            };
+
+            if (config.useFFmpeg) {
+                const outputDirectory = path.join(__dirname, '../../ffmpeg_tmp');
+                const outputPath = path.join(outputDirectory, `${songInfo.title.replace(/[\\/:*?"<>|]/g, '')}.mp3`);
+
+                if (!fs.existsSync(outputDirectory)) {
+                    fs.mkdirSync(outputDirectory, { recursive: true });
+                }
+
+                if (!fs.existsSync(outputPath)) {
+                    logger.info(`Iniciando download para: ${songInfo.title}`);
+                    await this.downloadAndConvertAudio(videoUrl, outputPath);
+                    logger.info(`Download concluído: ${songInfo.title}`);
+                    preprocessedData.filePath = outputPath;
+                } else {
+                    preprocessedData.filePath = outputPath;
+                }
+            } else {
+                preprocessedData.streamOptions = {
+                    filter: 'audioonly',
+                    quality: 'highestaudio',
+                    highWaterMark: 1 << 25,
+                };
+            }
+
+            this.preprocessedTracks.set(trackKey, preprocessedData);
+            logger.info(`Pré-processamento concluído para: ${songInfo.title}`);
+
+        } catch (error) {
+            logger.error(`Erro ao pré-processar música: ${trackInfo.query}`, error);
+            throw error;
         }
     }
 
@@ -64,112 +212,73 @@ class MusicPlayer {
             logger.error('Unable to determine guild ID in playNext');
             return;
         }
-    
+
         const serverQueue = this.queue.get(guildId);
         if (!serverQueue || serverQueue.length === 0) {
-            this.queue.delete(guildId);
-            if (connection) connection.destroy();
-            this.currentConnection = null;
-            this.currentMessage = null;
+            this.cleanup(guildId);
             return;
         }
-    
-        const song = serverQueue[0]; // Não remover a música ainda
-    
+
+        const song = serverQueue[0];
+        const trackKey = `${guildId}-${song.query}`;
+        
         try {
-            let videoUrl;
-            let songInfo;
-    
-            if (song.query.includes('open.spotify.com')) {
-                // Obtendo informações da música do Spotify
-                const trackInfo = await this.spotifyHandler.getTrackInfo(song.query);
-                logger.info('Track info from Spotify:', trackInfo); // Log de debug
-    
-                videoUrl = await this.youtubeHandler.search(`${trackInfo.name} ${trackInfo.artists}`);
-                logger.info('Video URL from YouTube search:', videoUrl); // Log de debug
-                
-                // Verifique se o videoUrl foi retornado corretamente
-                if (!videoUrl) {
-                    logger.error('No video URL found for track:', trackInfo);
-                    throw new Error('Video URL not found');
-                }
-    
-                songInfo = {
-                    title: trackInfo.name || 'Unknown Title',
-                    author: trackInfo.artists || 'Unknown',
-                    duration: trackInfo.duration ? Utils.formatDuration(trackInfo.duration) : 'Unkown',
-                    thumbnail: trackInfo.albumCover || null // Pega a miniatura (capa do álbum)
-                };
+            const preprocessedData = this.preprocessedTracks.get(trackKey);
+            
+            if (preprocessedData) {
+                const resource = config.useFFmpeg && preprocessedData.filePath
+                    ? createAudioResource(preprocessedData.filePath)
+                    : createAudioResource(ytdl(preprocessedData.videoUrl, preprocessedData.streamOptions));
+
+                this.player.play(resource);
+                this.sendNowPlayingEmbed(message, preprocessedData.songInfo, preprocessedData.videoUrl, song.requester);
             } else {
-                videoUrl = await this.youtubeHandler.search(song.query);
-                logger.info('Video URL from search:', videoUrl); // Log de debug
-                if (videoUrl) {
-                    songInfo = await ytdl.getInfo(videoUrl); // Buscar informações sobre a música do YouTube
-                    logger.info('Song info from YouTube:', songInfo); // Log de debug
+                let videoUrl;
+                let songInfo;
 
-                    // Definindo songInfo com informações do YouTube
-                    const videoDetails = songInfo.videoDetails;
-
-                    // Condições para extrair informações relevantes do YouTube
+                if (song.query.includes('open.spotify.com')) {
+                    const trackInfo = await this.spotifyHandler.getTrackInfo(song.query);
+                    videoUrl = await this.youtubeHandler.search(`${trackInfo.name} ${trackInfo.artists}`);
+                    songInfo = {
+                        title: trackInfo.name || 'Unknown Title',
+                        author: trackInfo.artists || 'Unknown',
+                        duration: trackInfo.duration ? Utils.formatDuration(trackInfo.duration) : 'Unknown',
+                        thumbnail: trackInfo.albumCover || null,
+                    };
+                } else {
+                    videoUrl = await this.youtubeHandler.search(song.query);
+                    const videoDetails = (await ytdl.getInfo(videoUrl)).videoDetails;
                     songInfo = {
                         title: videoDetails.title || 'Unknown Title',
                         author: videoDetails.author.name || 'Unknown',
                         duration: videoDetails.lengthSeconds ? Utils.formatDuration(videoDetails.lengthSeconds) : 'Unknown',
-                        thumbnail: videoDetails.thumbnails?.[0]?.url || null // Miniatura do vídeo
+                        thumbnail: videoDetails.thumbnails?.[0]?.url || null,
                     };
                 }
+
+                if (config.useFFmpeg) {
+                    const outputDirectory = path.join(__dirname, '../../ffmpeg_tmp');
+                    const outputPath = path.join(outputDirectory, `${songInfo.title.replace(/[\\/:*?"<>|]/g, '')}.mp3`);
+
+                    if (!fs.existsSync(outputDirectory)) {
+                        fs.mkdirSync(outputDirectory, { recursive: true });
+                    }
+
+                    await this.downloadAndConvertAudio(videoUrl, outputPath);
+                    const resource = createAudioResource(outputPath);
+                    this.player.play(resource);
+                } else {
+                    const resource = createAudioResource(ytdl(videoUrl, { filter: 'audioonly' }));
+                    this.player.play(resource);
+                }
+
+                this.sendNowPlayingEmbed(message, songInfo, videoUrl, song.requester);
             }
-    
-            if (!videoUrl || !songInfo) {
-                if (message) message.channel.send('Could not find the song on YouTube. Skipping to next song.');
-                serverQueue.shift(); // Remover a música se não puder ser reproduzida
-                return this.playNext(connection, message);
-            }
-    
-            const stream = ytdl(videoUrl, {
-                filter: 'audioonly',
-                quality: 'highestaudio',
-                highWaterMark: 1 << 25,
-            });
-    
-            const resource = createAudioResource(stream);
-            this.player.play(resource);
-    
-            // Se a informação da música for do YouTube, extraia a miniatura
-            const thumbnail = songInfo.thumbnail || songInfo.videoDetails?.thumbnails?.[0]?.url || null;
-    
-            // Criar o embed com informações da música e miniatura
-            const embed = new EmbedBuilder()
-                .setTitle(`🎶 Now Playing`)
-                .setDescription(`[${songInfo.title}](${videoUrl})`)
-                .addFields(
-                    { name: 'Requested by', value: `<@${song.requester}>`, inline: true },
-                    { name: 'Author', value: songInfo.author, inline: true },
-                    { name: 'Duration', value: songInfo.duration, inline: true },
-                    { name: 'Queue Position', value: `#${serverQueue.length}`, inline: true }
-                )
-                .setColor(Colors.Blue) // Use o enum Colors
-                .setThumbnail(thumbnail) // Adiciona a miniatura
-                .setTimestamp();
-    
-            if (message) {
-                message.channel.send({ embeds: [embed] });
-            }
-    
-            serverQueue.shift(); // Remover a música da fila após começar a tocar
-    
-            stream.on('error', (error) => {
-                logger.error('Error in audio stream:', error);
-                if (message) message.channel.send('There was an error playing this song. Skipping to next song.');
-                this.playNext(connection, message);
-            });
-    
+
+            serverQueue.shift();
         } catch (error) {
-            console.log(error);
-            logger.error('Error in playNext method:', error);
-            if (message) message.channel.send('There was an error playing this song. Skipping to next song.');
-            serverQueue.shift(); // Remover a música problemática
-            this.playNext(connection, message);
+            logger.error('Erro ao tocar próxima música:', error);
+            message.reply('Ocorreu um erro ao tentar tocar a próxima música.');
         }
     }
 
@@ -178,33 +287,79 @@ class MusicPlayer {
         const serverQueue = this.queue.get(guildId);
     
         if (serverQueue) {
-            serverQueue.songs = []; // Limpa a fila
-            this.queue.delete(guildId); // Remove a fila atual
+            serverQueue.length = 0;
+            this.queue.delete(guildId);
         }
     
-        // Destruir a conexão de voz
         const connection = getVoiceConnection(guildId);
-        if (connection) {
+        if (connection && !connection.state.status === 'destroyed') {
             connection.destroy();
         }
     
-        message.channel.send('Playback stopped and queue cleared.');
-    }
+        this.player.stop(true);
+        this.cleanup(guildId);
     
+        message.channel.send('Reprodução parada e fila limpa.');
+    }
 
     skip(message) {
         const connection = getVoiceConnection(message.guild.id);
         if (!connection) {
-            return message.reply('I\'m not playing any music right now.');
+            return message.reply('Não estou tocando nenhuma música no momento.');
         }
 
         const serverQueue = this.queue.get(message.guild.id);
         if (!serverQueue || serverQueue.length === 0) {
-            return message.reply('There are no songs in the queue to play.');
+            return message.reply('Não há músicas na fila para tocar.');
         }
 
-        this.player.stop(); // This will trigger the 'idle' event, which will call playNext
-        message.reply('Song skipped!');
+        this.player.stop();
+        message.reply('Música pulada!');
+    }
+
+    cleanOldPreprocessedTracks() {
+        const ONE_HOUR = 3600000;
+        const now = Date.now();
+
+        for (const [key, data] of this.preprocessedTracks.entries()) {
+            if (now - data.timestamp > ONE_HOUR) {
+                if (data.filePath && fs.existsSync(data.filePath)) {
+                    try {
+                        fs.unlinkSync(data.filePath);
+                    } catch (error) {
+                        logger.error('Error removing old preprocessed file:', error);
+                    }
+                }
+                this.preprocessedTracks.delete(key);
+            }
+        }
+    }
+
+    sendNowPlayingEmbed(message, songInfo, videoUrl, requesterId) {
+        const embed = new EmbedBuilder()
+            .setColor(Colors.Gold)
+            .setTitle(`Tocando agora: ${songInfo.title}`)
+            .setURL(videoUrl)
+            .setDescription(`**Solicitado por:** <@${requesterId}>`)
+            .setThumbnail(songInfo.thumbnail)
+            .addFields(
+                { name: 'Artista', value: songInfo.author, inline: true },
+                { name: 'Duração', value: songInfo.duration, inline: true }
+            )
+            .setTimestamp();
+
+        message.channel.send({ embeds: [embed] });
+    }
+
+    cleanup(guildId) {
+        if (this.queue.has(guildId)) {
+            this.queue.delete(guildId);
+        }
+
+        const connection = getVoiceConnection(guildId);
+        if (connection) {
+            connection.destroy();
+        }
     }
 }
 
